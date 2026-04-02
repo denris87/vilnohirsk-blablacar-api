@@ -31,7 +31,7 @@ mongoose.connect(MONGO_URI)
   .catch(err => console.error('❌ MongoDB error:', err));
 
 const rideSchema = new mongoose.Schema({
-  type: String, from: String, to: String, date: String, time: String,
+  type: String, name: String, from: String, to: String, date: String, time: String,
   seats: Number, price: Number, phone: String, comment: String,
   createdAt: { type: Date, default: Date.now }
 });
