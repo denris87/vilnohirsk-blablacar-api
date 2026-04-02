@@ -5,82 +5,61 @@ require('dotenv').config();
 
 const app = express();
 
-// Максимально відкритий CORS для обходу будь-яких блокувань Telegram
-app.use(cors({
-  origin: '*',
-  methods: ['GET', 'POST', 'DELETE', 'PUT', 'PATCH', 'OPTIONS'],
-  allowedHeaders: '*'
-}));
+// Налаштування CORS - дозволяємо все і всім для Telegram
+app.use(cors());
+app.use((req, res, next) => {
+  res.header("Access-Control-Allow-Origin", "*");
+  res.header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
+  res.header("Access-Control-Allow-Headers", "Origin, X-Requested-With, Content-Type, Accept, Authorization");
+  if (req.method === 'OPTIONS') {
+    return res.sendStatus(200);
+  }
+  next();
+});
+
 app.use(express.json());
 
-// Тестовий маршрут, щоб перевірити, чи сервер взагалі "живий"
+// Головна сторінка для перевірки
 app.get('/', (req, res) => {
-  res.status(200).send('Сервер BlaBlaCar працює успішно!');
+  res.status(200).send('<h1>Сервер BlaBlaCar LIVE!</h1>');
 });
 
-// Підключення до бази даних MongoDB
+// Підключення до бази
 const MONGO_URI = process.env.MONGO_URI;
+mongoose.connect(MONGO_URI)
+  .then(() => console.log('✅ Connected to MongoDB'))
+  .catch(err => console.error('❌ MongoDB error:', err));
 
-if (!MONGO_URI) {
-  console.error('❌ КРИТИЧНА ПОМИЛКА: Не вказано MONGO_URI у Railway (Settings -> Variables)!');
-} else {
-  mongoose.connect(MONGO_URI)
-    .then(() => console.log('✅ Успішно підключено до MongoDB!'))
-    .catch(err => console.error('❌ Помилка підключення до MongoDB:', err));
-}
-
-// Схема для поїздки
 const rideSchema = new mongoose.Schema({
-  type: { type: String, required: true },
-  from: { type: String, required: true },
-  to: { type: String, required: true },
-  date: { type: String, required: true },
-  time: { type: String, required: true },
-  seats: { type: Number, required: true },
-  price: { type: Number },
-  phone: { type: String, required: true },
-  comment: { type: String },
+  type: String, from: String, to: String, date: String, time: String,
+  seats: Number, price: Number, phone: String, comment: String,
   createdAt: { type: Date, default: Date.now }
 });
-
 const Ride = mongoose.model('Ride', rideSchema);
 
-// === API 1: ОТРИМАТИ ВСІ ПОЇЗДКИ ===
+// API для отримання поїздок
 app.get('/api/rides', async (req, res) => {
   try {
     const today = new Date().toISOString().split('T')[0];
     const rides = await Ride.find({ date: { $gte: today } }).sort({ date: 1, time: 1 });
-    res.status(200).json(rides);
+    res.json(rides);
   } catch (error) {
-    console.error(error);
-    res.status(500).json({ error: 'Помилка сервера при отриманні поїздок' });
+    res.status(500).json({ error: error.message });
   }
 });
 
-// === API 2: ДОДАТИ НОВУ ПОЇЗДКУ ===
+// API для додавання поїздки
 app.post('/api/rides', async (req, res) => {
   try {
     const newRide = new Ride(req.body);
     await newRide.save();
-    res.status(201).json({ message: '✅ Поїздку успішно додано!', ride: newRide });
+    res.status(201).json(newRide);
   } catch (error) {
-    console.error(error);
-    res.status(500).json({ error: 'Помилка при збереженні поїздки' });
+    res.status(500).json({ error: error.message });
   }
 });
 
-// === API 3: ВИДАЛИТИ ПОЇЗДКУ ===
-app.delete('/api/rides/:id', async (req, res) => {
-  try {
-    await Ride.findByIdAndDelete(req.params.id);
-    res.status(200).json({ message: '✅ Поїздку видалено!' });
-  } catch (error) {
-    res.status(500).json({ error: 'Помилка при видаленні поїздки' });
-  }
-});
-
-// Запуск сервера (0.0.0.0 обов'язково для Railway)
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, '0.0.0.0', () => {
-  console.log(`🚀 Сервер BlaBlaCar працює на порту ${PORT}`);
+  console.log(`🚀 Server on port ${PORT}`);
 });
