@@ -5,7 +5,7 @@ require('dotenv').config();
 
 const app = express();
 
-// Налаштування CORS (дозволяємо запити з твого сайту в Telegram)
+// Налаштування CORS (дозволяємо запити з Telegram Web App)
 app.use(cors());
 app.use(express.json());
 
@@ -15,15 +15,15 @@ mongoose.connect(MONGO_URI)
   .then(() => console.log('✅ Успішно підключено до MongoDB!'))
   .catch(err => console.error('❌ Помилка підключення до MongoDB:', err));
 
-// Створюємо структуру (Схему) для поїздки
+// Схема для поїздки
 const rideSchema = new mongoose.Schema({
-  type: { type: String, required: true }, // 'driver' або 'passenger'
+  type: { type: String, required: true },
   from: { type: String, required: true },
   to: { type: String, required: true },
-  date: { type: String, required: true }, // Формат YYYY-MM-DD
+  date: { type: String, required: true },
   time: { type: String, required: true },
   seats: { type: Number, required: true },
-  price: { type: Number }, // Може бути порожнім для пасажира
+  price: { type: Number },
   phone: { type: String, required: true },
   comment: { type: String },
   createdAt: { type: Date, default: Date.now }
@@ -32,14 +32,10 @@ const rideSchema = new mongoose.Schema({
 const Ride = mongoose.model('Ride', rideSchema);
 
 // === API 1: ОТРИМАТИ ВСІ ПОЇЗДКИ ===
-// Віддає тільки АКТУАЛЬНІ поїздки (сьогоднішні та майбутні)
 app.get('/api/rides', async (req, res) => {
   try {
-    const today = new Date().toISOString().split('T')[0]; // Отримуємо '2026-04-02'
-    
-    // Шукаємо поїздки, дата яких >= сьогоднішній
+    const today = new Date().toISOString().split('T')[0];
     const rides = await Ride.find({ date: { $gte: today } }).sort({ date: 1, time: 1 });
-    
     res.status(200).json(rides);
   } catch (error) {
     console.error(error);
@@ -69,7 +65,6 @@ app.delete('/api/rides/:id', async (req, res) => {
   }
 });
 
-// Запуск сервера
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`🚀 Сервер BlaBlaCar працює на порту ${PORT}`);
