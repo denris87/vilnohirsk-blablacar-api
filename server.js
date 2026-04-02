@@ -5,15 +5,29 @@ require('dotenv').config();
 
 const app = express();
 
-// Налаштування CORS (дозволяємо запити з Telegram Web App)
-app.use(cors());
+// Максимально відкритий CORS для обходу будь-яких блокувань Telegram
+app.use(cors({
+  origin: '*',
+  methods: ['GET', 'POST', 'DELETE', 'PUT', 'PATCH', 'OPTIONS'],
+  allowedHeaders: '*'
+}));
 app.use(express.json());
+
+// Тестовий маршрут, щоб перевірити, чи сервер взагалі "живий"
+app.get('/', (req, res) => {
+  res.status(200).send('Сервер BlaBlaCar працює успішно!');
+});
 
 // Підключення до бази даних MongoDB
 const MONGO_URI = process.env.MONGO_URI;
-mongoose.connect(MONGO_URI)
-  .then(() => console.log('✅ Успішно підключено до MongoDB!'))
-  .catch(err => console.error('❌ Помилка підключення до MongoDB:', err));
+
+if (!MONGO_URI) {
+  console.error('❌ КРИТИЧНА ПОМИЛКА: Не вказано MONGO_URI у Railway (Settings -> Variables)!');
+} else {
+  mongoose.connect(MONGO_URI)
+    .then(() => console.log('✅ Успішно підключено до MongoDB!'))
+    .catch(err => console.error('❌ Помилка підключення до MongoDB:', err));
+}
 
 // Схема для поїздки
 const rideSchema = new mongoose.Schema({
@@ -65,7 +79,8 @@ app.delete('/api/rides/:id', async (req, res) => {
   }
 });
 
+// Запуск сервера (0.0.0.0 обов'язково для Railway)
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
+app.listen(PORT, '0.0.0.0', () => {
   console.log(`🚀 Сервер BlaBlaCar працює на порту ${PORT}`);
 });
