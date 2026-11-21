@@ -83,18 +83,22 @@ function rideTime(t) { // 12:00 або 12:00 - 12:30 → з 12:00 до 12:30
   const p = String(t || '').split(/\s*[-–—]\s*/).filter(Boolean);
   return p.length === 2 ? `з ${p[0]} до ${p[1]}` : String(t || '').trim();
 }
+// Шаблон — жирним, те, що вписала людина, — звичайним (розмітка HTML, тож її текст екрануємо)
 function rideText(r) {
-  const drv = r.type !== 'passenger', one = (v) => String(v == null ? '' : v).replace(/\s+/g, ' ').trim();
+  const drv = r.type !== 'passenger';
+  const one = (v) => String(v == null ? '' : v).replace(/\s+/g, ' ').trim();
+  const esc = (v) => one(v).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  const b = (label) => `<b>${label}</b>`;
   const lines = [
-    drv ? '#Водій' : '#Пасажир',
-    `Маршрут: ${one(r.from)} → ${one(r.to)}`,
-    `Дата: ${rideDate(r.date)}`,
-    `Час: ${rideTime(r.time)}`,
-    `${drv ? 'Кількість вільних місць' : 'Кількість необхідних місць'}: ${one(r.seats)}`
+    drv ? `🚗 ${b('#Водій')}` : `🧍 ${b('#Пасажир')}`,
+    `📍 ${b('Маршрут:')} ${esc(r.from)} → ${esc(r.to)}`,
+    `🗓 ${b('Дата:')} ${esc(rideDate(r.date))}`,
+    `🕐 ${b('Час:')} ${esc(rideTime(r.time))}`,
+    `💺 ${b(drv ? 'Кількість вільних місць:' : 'Кількість необхідних місць:')} ${esc(r.seats)}`
   ];
-  if (Number(r.price) > 0) lines.push(`Ціна: ${Number(r.price)} грн`);
-  if (one(r.comment)) lines.push(`Коментар: ${one(r.comment).slice(0, 500)}`);
-  lines.push(`Телефон: ${one(r.phone)}`);
+  if (Number(r.price) > 0) lines.push(`💰 ${b('Ціна:')} ${Number(r.price)} грн`);
+  if (one(r.comment)) lines.push(`💬 ${b('Коментар:')} ${esc(one(r.comment).slice(0, 500))}`);
+  lines.push(`📞 ${b('Телефон:')} ${esc(r.phone)}`);
   return lines.join('\n');
 }
 
@@ -131,7 +135,7 @@ function tgAllowed(ip) {
 async function tgPostRide(ride, ip) {
   if (!TG_TOKEN) return;
   if (!tgAllowed(ip || '?')) { console.warn('Telegram: забагато постів, поїздку в чат не надсилаємо'); return; }
-  const d = await tgCall('sendMessage', { chat_id: TG_CHAT, text: rideText(ride) });
+  const d = await tgCall('sendMessage', { chat_id: TG_CHAT, text: rideText(ride), parse_mode: 'HTML' });
   if (d && d.ok && d.result && d.result.message_id) {
     await Ride.updateOne({ _id: ride._id }, { $set: { tgMessageId: d.result.message_id } }).catch(e => console.error('tgMessageId:', e.message));
   }
