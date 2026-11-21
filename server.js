@@ -9,6 +9,7 @@ require('dotenv').config();
 admin.initializeApp({ projectId: process.env.FIREBASE_PROJECT_ID || 'smart-vilnohirsk' });
 
 const app = express();
+app.set('trust proxy', true); // Railway стоїть перед сервером: справжня IP-адреса — у X-Forwarded-For
 
 // Налаштування CORS - дозволяємо все і всім для Telegram
 app.use(cors());
@@ -40,6 +41,8 @@ const rideSchema = new mongoose.Schema({
   seats: Number, price: Number, phone: String, comment: String,
   // Хто подав поїздку з «Мого кабінету» (ID акаунта Firebase). Назовні не віддаємо.
   ownerUid: { type: String, index: true },
+  // Номер поста в Telegram-чаті попуток — щоб прибрати його, коли поїздку видалять. Назовні не віддаємо.
+  tgMessageId: Number,
   createdAt: { type: Date, default: Date.now }
 });
 const Ride = mongoose.model('Ride', rideSchema);
@@ -57,11 +60,85 @@ async function getUid(req) {
   }
 }
 
-// Поїздку віддаємо без ID власника
+// Поїздку віддаємо без ID власника й номера поста
 function publicRide(doc) {
   const o = doc.toObject ? doc.toObject() : Object.assign({}, doc);
-  delete o.ownerUid;
+  delete o.ownerUid; delete o.tgMessageId;
   return o;
+}
+
+// === Публікація в Telegram-чаті попуток ===
+// Нова поїздка з сайту → пост у чаті; людина видалила поїздку на сайті або її автора заблокували → пост прибираємо.
+// Через 3 дні чат сам видаляє старі повідомлення. Токен бота — у змінній Railway TELEGRAM_BOT_TOKEN.
+const TG_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
+const TG_CHAT = process.env.TELEGRAM_CHAT_ID || '@blablacarvln';
+const UA_WEEKDAYS = ['неділя', 'понеділок', 'вівторок', 'середа', 'четвер', "п'ятниця", 'субота'];
+
+function rideDate(d) { // 2026-11-22 → 22.11.2026, субота
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(d || ''));
+  if (!m) return String(d || '');
+  return `${m[3]}.${m[2]}.${m[1]}, ${UA_WEEKDAYS[new Date(Date.UTC(+m[1], +m[2] - 1, +m[3])).getUTCDay()]}`;
+}
+function rideTime(t) { // 12:00 або 12:00 - 12:30 → з 12:00 до 12:30
+  const p = String(t || '').split(/\s*[-–—]\s*/).filter(Boolean);
+  return p.length === 2 ? `з ${p[0]} до ${p[1]}` : String(t || '').trim();
+}
+function rideText(r) {
+  const drv = r.type !== 'passenger', one = (v) => String(v == null ? '' : v).replace(/\s+/g, ' ').trim();
+  const lines = [
+    drv ? '#Водій' : '#Пасажир',
+    `Маршрут: ${one(r.from)} → ${one(r.to)}`,
+    `Дата: ${rideDate(r.date)}`,
+    `Час: ${rideTime(r.time)}`,
+    `${drv ? 'Кількість вільних місць' : 'Кількість необхідних місць'}: ${one(r.seats)}`
+  ];
+  if (Number(r.price) > 0) lines.push(`Ціна: ${Number(r.price)} грн`);
+  if (one(r.comment)) lines.push(`Коментар: ${one(r.comment).slice(0, 500)}`);
+  lines.push(`Телефон: ${one(r.phone)}`);
+  return lines.join('\n');
+}
+
+async function tgCall(method, payload) {
+  if (!TG_TOKEN) return null;
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 10000);
+  try {
+    const r = await fetch(`https://api.telegram.org/bot${TG_TOKEN}/${method}`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload), signal: ctrl.signal
+    });
+    const d = await r.json().catch(() => ({}));
+    if (!d.ok) console.error(`Telegram ${method}: ${d.description || r.status}`);
+    return d;
+  } catch (e) {
+    console.error(`Telegram ${method}: ${e.message}`);
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// Захист чату від флуду: з однієї адреси — не більше 4 постів на годину, усього — не більше 40 на годину
+const tgSent = new Map();
+function tgAllowed(ip) {
+  const now = Date.now(), hour = 60 * 60 * 1000;
+  for (const [k, list] of tgSent) { const fresh = list.filter(t => now - t < hour); if (fresh.length) tgSent.set(k, fresh); else tgSent.delete(k); }
+  const mine = tgSent.get(ip) || [], all = [...tgSent.values()].reduce((n, l) => n + l.length, 0);
+  if (mine.length >= 4 || all >= 40) return false;
+  tgSent.set(ip, mine.concat(now));
+  return true;
+}
+
+async function tgPostRide(ride, ip) {
+  if (!TG_TOKEN) return;
+  if (!tgAllowed(ip || '?')) { console.warn('Telegram: забагато постів, поїздку в чат не надсилаємо'); return; }
+  const d = await tgCall('sendMessage', { chat_id: TG_CHAT, text: rideText(ride) });
+  if (d && d.ok && d.result && d.result.message_id) {
+    await Ride.updateOne({ _id: ride._id }, { $set: { tgMessageId: d.result.message_id } }).catch(e => console.error('tgMessageId:', e.message));
+  }
+}
+async function tgDeleteRide(ride) {
+  if (!ride || !ride.tgMessageId) return;
+  await tgCall('deleteMessage', { chat_id: TG_CHAT, message_id: ride.tgMessageId }); // якщо чат уже прибрав пост — Telegram просто відповість помилкою
 }
 
 // === Блокування шахраїв ===
@@ -97,11 +174,16 @@ function refreshBans() {
   bans.busy = (async () => {
     try {
       const today = new Date().toISOString().split('T')[0];
-      const rides = await Ride.find({ date: { $gte: today } }).select('ownerUid phone').lean();
+      const rides = await Ride.find({ date: { $gte: today } }).select('ownerUid phone tgMessageId').lean();
       const uids = [...new Set(rides.map(r => r.ownerUid).filter(Boolean))];
       const phones = [...new Set(rides.map(r => phone9(r.phone)).filter(Boolean))];
       const res = (uids.length || phones.length) ? await askBans(uids, phones) : { uids: new Set(), phones: new Set() };
       bans.uids = res.uids; bans.phones = res.phones; bans.at = Date.now();
+      // Пости заблокованих — геть із Telegram-чату
+      for (const r of rides.filter(x => x.tgMessageId && isBanned(x))) {
+        await tgDeleteRide(r);
+        await Ride.updateOne({ _id: r._id }, { $unset: { tgMessageId: 1 } });
+      }
     } catch (e) {
       console.error('Блокування: не вдалося оновити список —', e.message);
       bans.at = Date.now() - BANS_TTL + 30 * 1000;
@@ -140,7 +222,12 @@ app.post('/api/rides', async (req, res) => {
     const newRide = new Ride(body);
     await newRide.save();
     res.status(201).json(publicRide(newRide));
-    refreshBans(); // перевірити нового автора (у фоні): якщо заблокований — поїздку не покажемо
+    // У фоні: перевірити нового автора (заблокованого не покажемо) і, якщо все гаразд, опублікувати в Telegram-чаті
+    (async () => {
+      await refreshBans();
+      if (bans.busy) await bans.busy;
+      if (!isBanned(newRide)) await tgPostRide(newRide, req.ip);
+    })().catch(e => console.error('Публікація поїздки:', e.message));
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -151,7 +238,7 @@ app.get('/api/my-rides', async (req, res) => {
   const uid = await getUid(req);
   if (!uid) return res.status(401).json({ error: 'Потрібен вхід' });
   try {
-    const rides = await Ride.find({ ownerUid: uid }).select('-ownerUid').sort({ date: -1, time: -1 }).limit(100);
+    const rides = await Ride.find({ ownerUid: uid }).select('-ownerUid -tgMessageId').sort({ date: -1, time: -1 }).limit(100);
     res.json(rides);
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -164,9 +251,11 @@ app.delete('/api/rides/:id', async (req, res) => {
   if (!uid) return res.status(401).json({ error: 'Потрібен вхід' });
   if (!mongoose.isValidObjectId(req.params.id)) return res.status(404).json({ error: 'Поїздку не знайдено' });
   try {
-    const r = await Ride.deleteOne({ _id: req.params.id, ownerUid: uid });
-    if (!r.deletedCount) return res.status(404).json({ error: 'Поїздку не знайдено або вона не ваша' });
+    const ride = await Ride.findOne({ _id: req.params.id, ownerUid: uid });
+    if (!ride) return res.status(404).json({ error: 'Поїздку не знайдено або вона не ваша' });
+    await Ride.deleteOne({ _id: ride._id });
     res.json({ ok: true });
+    tgDeleteRide(ride).catch(() => {}); // і з Telegram-чату
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
