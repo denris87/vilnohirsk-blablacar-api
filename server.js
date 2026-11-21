@@ -99,6 +99,8 @@ function rideText(r) {
   if (Number(r.price) > 0) lines.push(`💰 ${b('Ціна:')} ${Number(r.price)} грн`);
   if (one(r.comment)) lines.push(`💬 ${b('Коментар:')} ${esc(one(r.comment).slice(0, 500))}`);
   lines.push(`📞 ${b('Телефон:')} ${esc(r.phone)}`);
+  // Підпис: щоб люди знали, де подати таке оголошення
+  lines.push('------------------', '<i>оголошення опубліковано через сайт</i> <b><a href="https://vilnohirsk.online">vilnohirsk.online</a></b>');
   return lines.join('\n');
 }
 
@@ -135,7 +137,7 @@ function tgAllowed(ip) {
 async function tgPostRide(ride, ip) {
   if (!TG_TOKEN) return;
   if (!tgAllowed(ip || '?')) { console.warn('Telegram: забагато постів, поїздку в чат не надсилаємо'); return; }
-  const d = await tgCall('sendMessage', { chat_id: TG_CHAT, text: rideText(ride), parse_mode: 'HTML' });
+  const d = await tgCall('sendMessage', { chat_id: TG_CHAT, text: rideText(ride), parse_mode: 'HTML', link_preview_options: { is_disabled: true } });
   if (d && d.ok && d.result && d.result.message_id) {
     await Ride.updateOne({ _id: ride._id }, { $set: { tgMessageId: d.result.message_id } }).catch(e => console.error('tgMessageId:', e.message));
   }
