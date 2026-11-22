@@ -9,7 +9,34 @@ require('dotenv').config();
 admin.initializeApp({ projectId: process.env.FIREBASE_PROJECT_ID || 'smart-vilnohirsk' });
 
 const app = express();
-app.set('trust proxy', true); // Railway стоїть перед сервером: справжня IP-адреса — у X-Forwarded-For
+app.disable('x-powered-by'); // не підказуємо, на чому працює сервер
+
+// Справжня IP-адреса людини. Railway стоїть перед сервером і ДОПИСУЄ її в кінець X-Forwarded-For;
+// усе, що лівіше, могла вписати сама людина (підробити), тому беремо першу ззовні адресу справа.
+function isPrivateIp(ip) {
+  ip = String(ip || '').toLowerCase();
+  const v4 = /^(\d+)\.(\d+)\.\d+\.\d+$/.exec(ip);
+  if (v4) {
+    const a = +v4[1], b = +v4[2];
+    return a === 10 || a === 127 || a === 0 || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168) ||
+      (a === 100 && b >= 64 && b <= 127) || (a === 169 && b === 254);
+  }
+  return !ip || ip === '::1' || ip === '::' || /^f[cd]/.test(ip) || /^fe[89ab]/.test(ip);
+}
+function cleanIp(ip) {
+  ip = String(ip || '').trim().replace(/^\[([^\]]+)\](:\d+)?$/, '$1').replace(/^(\d+\.\d+\.\d+\.\d+):\d+$/, '$1');
+  return ip.replace(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/i, '$1');
+}
+function clientIp(req) {
+  const chain = String(req.headers['x-forwarded-for'] || '').split(',').map(cleanIp).filter(Boolean);
+  for (let i = chain.length - 1; i >= 0; i--) if (!isPrivateIp(chain[i])) return chain[i];
+  return cleanIp(req.socket && req.socket.remoteAddress) || '?';
+}
+
+app.use((req, res, next) => {
+  res.set('X-Content-Type-Options', 'nosniff');
+  next();
+});
 
 // Налаштування CORS - дозволяємо все і всім для Telegram
 app.use(cors());
@@ -58,6 +85,58 @@ async function getUid(req) {
   } catch (e) {
     return undefined;
   }
+}
+
+// Що саме приймаємо від сайту. Лише ці поля — службові (власник, номер поста в чаті, дата створення)
+// ставить тільки сервер. Довгий текст обрізаємо, явно неправильне — не приймаємо.
+const RIDE_DAY = 24 * 60 * 60 * 1000;
+function rideField(v, lines) {
+  if (typeof v !== 'string' && typeof v !== 'number') return '';
+  v = String(v).replace(/[\u0000-\u0008\u000b-\u001f\u007f]/g, ''); // керівні символи — геть
+  return (lines ? v.replace(/[ \t]+/g, ' ').replace(/\n{3,}/g, '\n\n') : v.replace(/\s+/g, ' ')).trim();
+}
+function cleanRide(b) {
+  b = b && typeof b === 'object' ? b : {};
+  const type = rideField(b.type);
+  if (type !== 'driver' && type !== 'passenger') return { error: 'Оберіть: ви водій чи пасажир.' };
+  const from = rideField(b.from).slice(0, 40), to = rideField(b.to).slice(0, 40);
+  if (!from || !to) return { error: 'Вкажіть, звідки і куди їдете.' };
+  const date = rideField(b.date);
+  const dm = /^(\d{4})-(\d{2})-(\d{2})$/.exec(date);
+  const day = dm ? Date.UTC(+dm[1], +dm[2] - 1, +dm[3]) : NaN;
+  if (!dm || new Date(day).getUTCDate() !== +dm[3] || day < Date.now() - 2 * RIDE_DAY || day > Date.now() + 366 * RIDE_DAY) {
+    return { error: 'Перевірте дату поїздки.' };
+  }
+  const time = rideField(b.time);
+  if (!/^\d{1,2}:\d{2}(\s*[-–—]\s*\d{1,2}:\d{2})?$/.test(time)) return { error: 'Перевірте час поїздки.' };
+  const seats = Number(b.seats);
+  if (!Number.isInteger(seats) || seats < 1 || seats > 8) return { error: 'Перевірте кількість місць.' };
+  const price = b.price === undefined || b.price === null || b.price === '' ? 0 : Number(b.price);
+  if (!Number.isInteger(price) || price < 0 || price > 999999) return { error: 'Перевірте ціну.' };
+  const phone = rideField(b.phone), digits = phone.replace(/\D/g, '');
+  if (phone.length > 25 || !/^[+\d\s()-]+$/.test(phone) || digits.length < 10 || digits.length > 13) return { error: 'Перевірте номер телефону.' };
+  return { ride: { type, name: rideField(b.name).slice(0, 40), from, to, date, time, seats, price, phone, comment: rideField(b.comment, true).slice(0, 1000) } };
+}
+
+// Захист від флуду поїздками: з однієї адреси — не більше 10 на годину, усього — не більше 80 на годину
+const postsByIp = new Map();
+function postAllowed(ip) {
+  const now = Date.now(), hour = 60 * 60 * 1000;
+  let all = 0;
+  for (const [k, list] of postsByIp) {
+    const fresh = list.filter(t => now - t < hour);
+    if (fresh.length) { postsByIp.set(k, fresh); all += fresh.length; } else postsByIp.delete(k);
+  }
+  const mine = postsByIp.get(ip) || [];
+  if (mine.length >= 10 || all >= 80) return false;
+  postsByIp.set(ip, mine.concat(now));
+  return true;
+}
+
+// Назовні — лише загальне повідомлення; подробиці помилки — у журнал Railway
+function serverError(res, where, error) {
+  console.error(where + ':', error && error.message || error);
+  res.status(500).json({ error: 'Помилка сервера. Спробуйте трохи пізніше.' });
 }
 
 // Поїздку віддаємо без ID власника й номера поста
@@ -210,7 +289,7 @@ app.get('/api/rides', async (req, res) => {
     const rides = await Ride.find({ date: { $gte: today } }).sort({ date: 1, time: 1 });
     res.json(rides.filter(r => !isBanned(r)).map(publicRide));
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    serverError(res, 'GET /api/rides', error);
   }
 });
 
@@ -219,11 +298,16 @@ app.post('/api/rides', async (req, res) => {
   try {
     const uid = await getUid(req);
     if (uid === undefined) return res.status(401).json({ error: 'Вхід застарів. Увійдіть ще раз.' });
-    const body = Object.assign({}, req.body);
-    delete body._id; delete body.ownerUid; delete body.createdAt;
+    const ip = clientIp(req);
+    const { ride: body, error: bad } = cleanRide(req.body);
+    if (bad) return res.status(400).json({ error: bad });
     if (uid) body.ownerUid = uid;
     if ((uid && bans.uids.has(uid)) || bans.phones.has(phone9(body.phone))) {
       return res.status(403).json({ error: 'Подавати поїздки з цього акаунта або номера заборонено. Якщо це помилка — напишіть @vilnohirsk.' });
+    }
+    if (!postAllowed(ip)) {
+      console.warn('Попутки: забагато поїздок з однієї адреси або загалом — нову не прийнято');
+      return res.status(429).json({ error: 'Забагато оголошень за годину. Спробуйте трохи пізніше.' });
     }
     const newRide = new Ride(body);
     await newRide.save();
@@ -232,10 +316,10 @@ app.post('/api/rides', async (req, res) => {
     (async () => {
       await refreshBans();
       if (bans.busy) await bans.busy;
-      if (!isBanned(newRide)) await tgPostRide(newRide, req.ip);
+      if (!isBanned(newRide)) await tgPostRide(newRide, ip);
     })().catch(e => console.error('Публікація поїздки:', e.message));
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    serverError(res, 'POST /api/rides', error);
   }
 });
 
@@ -247,7 +331,7 @@ app.get('/api/my-rides', async (req, res) => {
     const rides = await Ride.find({ ownerUid: uid }).select('-ownerUid -tgMessageId').sort({ date: -1, time: -1 }).limit(100);
     res.json(rides);
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    serverError(res, 'GET /api/my-rides', error);
   }
 });
 
@@ -263,8 +347,17 @@ app.delete('/api/rides/:id', async (req, res) => {
     res.json({ ok: true });
     tgDeleteRide(ride).catch(() => {}); // і з Telegram-чату
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    serverError(res, 'DELETE /api/rides', error);
   }
+});
+
+// Невідома адреса й зіпсований запит (наприклад, неправильний JSON) — коротка відповідь без подробиць
+app.use((req, res) => res.status(404).json({ error: 'Не знайдено' }));
+app.use((err, req, res, next) => {
+  if (res.headersSent) return next(err);
+  const status = err && err.status >= 400 && err.status < 500 ? err.status : 500;
+  if (status === 500) console.error('Запит:', err && err.message || err);
+  res.status(status).json({ error: status === 413 ? 'Задовгий запит' : status === 500 ? 'Помилка сервера' : 'Неправильний запит' });
 });
 
 const PORT = process.env.PORT || 3000;
