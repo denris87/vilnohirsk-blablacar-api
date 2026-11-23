@@ -351,6 +351,42 @@ app.delete('/api/rides/:id', async (req, res) => {
   }
 });
 
+// === Бот техпідтримки сайту (@Vilnogirsk_bot): миттєві кнопки модерації й відповіді ===
+// Telegram надсилає оновлення бота сюди (webhook), а сервер одразу передає їх в Apps Script сайту.
+// Напряму в Apps Script Telegram слати не може: той відповідає переадресацією, яку Telegram не приймає.
+// Ключ webhook (заголовок X-Telegram-Bot-Api-Secret-Token) знає й перевіряє лише Apps Script — тут він не зберігається.
+// Вмикається в Apps Script функцією SUPPORT_WEBHOOK_ON, вимикається — SUPPORT_WEBHOOK_OFF.
+const tgRelayHits = [];
+app.post('/tg/support', async (req, res) => {
+  const token = String(req.get('X-Telegram-Bot-Api-Secret-Token') || '');
+  const update = req.body;
+  if (!/^[A-Za-z0-9_-]{32,256}$/.test(token) || !update || typeof update !== 'object' || !update.update_id) {
+    return res.status(403).json({ ok: false });
+  }
+  // Не більше 60 оновлень на хвилину: решту Telegram надішле згодом сам
+  const now = Date.now();
+  while (tgRelayHits.length && now - tgRelayHits[0] > 60000) tgRelayHits.shift();
+  if (tgRelayHits.length >= 60) return res.status(429).json({ ok: false });
+  tgRelayHits.push(now);
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 25000);
+  try {
+    const r = await fetch(APP_SCRIPT_URL, {
+      method: 'POST', headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+      body: JSON.stringify({ formType: 'support', action: 'tg', token, update }), signal: ctrl.signal
+    });
+    const d = await r.json().catch(() => null);
+    if (d && d.status === 'ok') return res.json({ ok: true });
+    console.error('Бот техпідтримки: Apps Script не прийняв оновлення —', d && d.status || r.status);
+    return res.status(d && d.status === 'forbidden' ? 403 : 502).json({ ok: false }); // Telegram повторить пізніше
+  } catch (e) {
+    console.error('Бот техпідтримки: Apps Script недоступний —', e.message);
+    return res.status(502).json({ ok: false });
+  } finally {
+    clearTimeout(timer);
+  }
+});
+
 // Невідома адреса й зіпсований запит (наприклад, неправильний JSON) — коротка відповідь без подробиць
 app.use((req, res) => res.status(404).json({ error: 'Не знайдено' }));
 app.use((err, req, res, next) => {
