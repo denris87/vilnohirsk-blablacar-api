@@ -91,27 +91,32 @@ async function getUid(req) {
 // ставить тільки сервер. Довгий текст обрізаємо, явно неправильне — не приймаємо.
 const RIDE_DAY = 24 * 60 * 60 * 1000;
 
-// === Дата за Києвом ===
-// Сервер на Railway живе за UTC, а доба в місті починається о 00:00 за Києвом (взимку це 22:00 UTC, улітку — 21:00).
-// Тому «сьогодні» для поїздок — лише так: за UTC вчорашні поїздки висіли б на сайті ще 2–3 години після півночі.
+// === Дата й час за Києвом ===
+// Сервер на Railway живе за UTC, а в місті — київський час (взимку UTC+2, улітку UTC+3). Дата й час поїздки
+// записані «як у Києві», тож і «зараз» рахуємо за київським годинником: за UTC поїздки зникали б на 2–3 години пізніше.
 let kyivFmt = null;
 try {
-  kyivFmt = new Intl.DateTimeFormat('en-US', { timeZone: 'Europe/Kiev', year: 'numeric', month: '2-digit', day: '2-digit' });
+  kyivFmt = new Intl.DateTimeFormat('en-US', { timeZone: 'Europe/Kiev', year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hourCycle: 'h23' });
 } catch (e) {
-  console.warn('Немає бази часових поясів — дату за Києвом рахуємо самі');
+  console.warn('Немає бази часових поясів — київський час рахуємо самі');
 }
-function kyivToday(at) { // → '2026-11-24'
+// Момент → київський «настінний» час числом, з точністю до хвилини: 25.11.2026 14:30 у Києві → Date.UTC(2026, 10, 25, 14, 30).
+// Такі числа можна прямо порівнювати з датою й часом поїздки.
+function kyivWall(at) {
   const d = new Date(at === undefined ? Date.now() : at);
   if (kyivFmt) {
     const p = {};
     kyivFmt.formatToParts(d).forEach(x => { p[x.type] = x.value; });
-    if (p.year && p.month && p.day) return `${p.year}-${p.month}-${p.day}`;
+    if (p.year && p.month && p.day && p.hour && p.minute) return Date.UTC(+p.year, +p.month - 1, +p.day, +p.hour % 24, +p.minute);
   }
   // Запасний шлях: UTC+2, а з останньої неділі березня до останньої неділі жовтня (з 01:00 UTC) — UTC+3
   const y = d.getUTCFullYear();
   const lastSunday = (m) => { const end = new Date(Date.UTC(y, m + 1, 0)); return Date.UTC(y, m, end.getUTCDate() - end.getUTCDay(), 1); };
   const t = d.getTime(), shift = t >= lastSunday(2) && t < lastSunday(9) ? 3 : 2;
-  return new Date(t + shift * 3600 * 1000).toISOString().slice(0, 10);
+  return Math.floor((t + shift * 3600 * 1000) / 60000) * 60000;
+}
+function kyivToday(at) { // → '2026-11-24'
+  return new Date(kyivWall(at)).toISOString().slice(0, 10);
 }
 function dayShift(day, n) { // '2026-11-24', -2 → '2026-11-22' (календарні дні)
   const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(day));
@@ -121,6 +126,36 @@ function rideField(v, lines) {
   if (typeof v !== 'string' && typeof v !== 'number') return '';
   v = String(v).replace(/[\u0000-\u0008\u000b-\u001f\u007f]/g, ''); // керівні символи — геть
   return (lines ? v.replace(/[ \t]+/g, ' ').replace(/\n{3,}/g, '\n\n') : v.replace(/\s+/g, ' ')).trim();
+}
+// === Коли поїздка минула ===
+// Час «з … до …» — поїздку видно, доки не мине година після кінця проміжку (за Києвом): «з 12:00 до 12:30» — до 13:30,
+// «з 23:30 до 00:30» — до 01:30 наступного дня. Лише один час («о 12:00») — до кінця доби: опівночі поїздка зникає.
+const RIDE_GRACE = 60 * 60 * 1000;
+// '12:00' → { from: 720, to: 720, range: false }; '12:00 - 12:30' → { from: 720, to: 750, range: true };
+// '23:30 - 00:30' → { from: 1410, to: 1470, range: true }; не розібрати → null
+function rideMinutes(t) {
+  const all = (String(t || '').match(/\d{1,2}:\d{2}/g) || []).map(x => { const [h, m] = x.split(':').map(Number); return h < 24 && m < 60 ? h * 60 + m : NaN; });
+  if (!all.length || all.some(isNaN)) return null;
+  const from = all[0];
+  let to = all[all.length - 1];
+  if (to < from) to += 24 * 60; // кінець — уже після півночі
+  return { from, to, range: all.length > 1 };
+}
+// Київський «настінний» момент, коли поїздку прибираємо; null — дата не у форматі 2026-11-25
+function rideEndsAt(r) {
+  const dm = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(r.date || ''));
+  if (!dm) return null;
+  const day = Date.UTC(+dm[1], +dm[2] - 1, +dm[3]), mins = rideMinutes(r.time);
+  // Проміжок — через годину після його кінця; один час (або час не розібрати) — з початком нової доби
+  return mins && mins.range ? day + mins.to * 60000 + RIDE_GRACE : day + RIDE_DAY;
+}
+function rideIsPast(r, now) {
+  now = now === undefined ? Date.now() : now;
+  const end = rideEndsAt(r);
+  if (end !== null) return kyivWall(now) >= end;
+  // Дата не у форматі 2026-11-25 (так могли записатись дуже старі поїздки) — прибираємо, коли поїздці понад тиждень
+  const made = r.createdAt ? new Date(r.createdAt).getTime() : 0;
+  return !made || now - made > 7 * RIDE_DAY;
 }
 function cleanRide(b) {
   b = b && typeof b === 'object' ? b : {};
@@ -136,7 +171,8 @@ function cleanRide(b) {
   }
   if (date < kyivToday()) return { error: 'Ця дата вже минула. Оберіть сьогодні або пізніший день.' };
   const time = rideField(b.time);
-  if (!/^\d{1,2}:\d{2}(\s*[-–—]\s*\d{1,2}:\d{2})?$/.test(time)) return { error: 'Перевірте час поїздки.' };
+  if (!/^\d{1,2}:\d{2}(\s*[-–—]\s*\d{1,2}:\d{2})?$/.test(time) || !rideMinutes(time)) return { error: 'Перевірте час поїздки.' };
+  if (rideIsPast({ date, time })) return { error: 'Час цієї поїздки вже минув. Перевірте дату й час.' };
   const seats = Number(b.seats);
   if (!Number.isInteger(seats) || seats < 1 || seats > 8) return { error: 'Перевірте кількість місць.' };
   const price = b.price === undefined || b.price === null || b.price === '' ? 0 : Number(b.price);
@@ -176,8 +212,8 @@ function publicRide(doc) {
 
 // === Публікація в Telegram-чаті попуток ===
 // Нова поїздка з сайту → пост у чаті; людина видалила поїздку на сайті або її автора заблокували → пост прибираємо.
-// Поїздка минула (настала нова доба за Києвом) — пост теж прибираємо (див. «Минулі поїздки» нижче).
-// Через 3 дні чат сам видаляє старі повідомлення. Токен бота — у змінній Railway TELEGRAM_BOT_TOKEN.
+// Поїздка минула (див. «Коли поїздка минула» вище) — пост теж прибираємо (див. «Минулі поїздки» нижче).
+// Токен бота — у змінній Railway TELEGRAM_BOT_TOKEN.
 const TG_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
 const TG_CHAT = process.env.TELEGRAM_CHAT_ID || '@blablacarvln';
 const UA_WEEKDAYS = ['неділя', 'понеділок', 'вівторок', 'середа', 'четвер', "п'ятниця", 'субота'];
@@ -255,14 +291,14 @@ async function tgDeleteRide(ride) {
   await tgCall('deleteMessage', { chat_id: TG_CHAT, message_id: ride.tgMessageId }); // якщо чат уже прибрав пост — Telegram просто відповість помилкою
 }
 
-// === Минулі поїздки: з початком нової доби (00:00 за Києвом) — геть із сайту й із Telegram-чату ===
-// Поїздку на 25.11 видно весь день 25.11. О 00:00 26.11 за Києвом вона зникає зі списку на сайті (список бере лише
-// поїздки від «сьогодні за Києвом»), а щойно сервер це помітить (перевіряє щохвилини й одразу після запуску) —
+// === Минулі поїздки: геть із сайту й із Telegram-чату ===
+// Поїздку «25.11 з 12:00 до 12:30» видно до 13:30 25.11 за Києвом, «25.11 о 12:00» — до 00:00 26.11. Потім вона одразу
+// зникає зі списку на сайті (список віддає лише поїздки, що ще не минули), а щойно сервер це помітить (перевіряє щохвилини й одразу після запуску) —
 // її пост видаляється з чату, а сама поїздка — з бази (тож і з «Моїх оголошень» у кабінеті).
 // Telegram дає боту видаляти лише пости, молодші за 48 годин. Старіший пост бот не видалить — тоді замінює його
 // текст на «Поїздка вже відбулася» (без телефону). Не вийшло через збій Telegram — пробуємо знову за 10 хвилин.
-const SWEEP_RETRY = 10 * 60 * 1000;
-const sweep = { day: '', tried: '', busy: null, next: 0 }; // day — за яку добу вже прибрано; tried — остання спроба
+const SWEEP_EVERY = 60 * 1000, SWEEP_RETRY = 10 * 60 * 1000;
+const sweep = { busy: null, next: 0 }; // next — не раніше якого моменту прибирати знову
 const pause = (ms) => new Promise(r => setTimeout(r, ms));
 
 function rideGoneText(r) {
@@ -281,29 +317,18 @@ async function tgExpireRide(r) {
   const ed = await tgCall('editMessageText', { chat_id: TG_CHAT, message_id: r.tgMessageId, text: rideGoneText(r), parse_mode: 'HTML', link_preview_options: { is_disabled: true } });
   return verdict(ed, 'edited') || 'gone';
 }
-function rideIsPast(r, today, now) {
-  const d = String(r.date || '');
-  if (/^\d{4}-\d{2}-\d{2}$/.test(d)) return d < today;
-  // Дата не у форматі 2026-11-25 (так могли записатись дуже старі поїздки) — прибираємо, коли поїздці понад тиждень
-  const made = r.createdAt ? new Date(r.createdAt).getTime() : 0;
-  return !made || now - made > 7 * RIDE_DAY;
-}
 function sweepDue(now) {
   now = now === undefined ? Date.now() : now;
-  if (sweep.busy) return false;
-  const today = kyivToday(now);
-  if (today === sweep.day) return false; // цю добу вже прибрано
-  return today !== sweep.tried || now >= sweep.next; // нова доба — одразу; повтор у ту саму добу — через 10 хвилин
+  return !sweep.busy && now >= sweep.next; // щохвилини; після збою Telegram — через 10 хвилин
 }
 function sweepPastRides() {
   if (sweep.busy) return sweep.busy;
   sweep.busy = (async () => {
     const now = Date.now(), today = kyivToday(now), giveUp = dayShift(today, -2);
     let later = false, removed = 0, posts = 0;
-    sweep.tried = today;
     try {
-      const all = await Ride.find({}).select('type from to date tgMessageId createdAt').lean();
-      for (const r of all.filter(x => rideIsPast(x, today, now))) {
+      const all = await Ride.find({}).select('type from to date time tgMessageId createdAt').lean();
+      for (const r of all.filter(x => rideIsPast(x, now))) {
         if (r.tgMessageId && TG_TOKEN) {
           const res = await tgExpireRide(r);
           await pause(300); // не поспішаємо: Telegram обмежує частоту запитів
@@ -318,20 +343,20 @@ function sweepPastRides() {
         await Ride.deleteOne({ _id: r._id });
         removed++;
       }
-      if (removed || later) console.log(`Минулі поїздки (сьогодні за Києвом ${today}): прибрано ${removed}, постів у чаті ${posts}` + (later ? ', решту — пізніше' : ''));
+      if (removed || later) console.log(`Минулі поїздки (${new Date(kyivWall(now)).toISOString().slice(0, 16).replace('T', ' ')} за Києвом): прибрано ${removed}, постів у чаті ${posts}` + (later ? ', решту — пізніше' : ''));
     } catch (e) {
       console.error('Минулі поїздки:', e.message);
       later = true;
     } finally {
-      if (later) sweep.next = Date.now() + SWEEP_RETRY;
-      else { sweep.day = today; sweep.next = 0; }
+      // Наступне прибирання — за хвилину від початку цього (таймер нижче), після збою Telegram — за 10 хвилин
+      sweep.next = now + (later ? SWEEP_RETRY : SWEEP_EVERY - 5000);
       sweep.busy = null;
     }
   })();
   return sweep.busy;
 }
-// Щохвилини: чи не настала нова доба за Києвом (або час повторити невдалу спробу)
-const sweepTimer = setInterval(() => { if (sweepDue()) sweepPastRides(); }, 60 * 1000);
+// Щохвилини: чи не минула ще якась поїздка (або час повторити невдалу спробу)
+const sweepTimer = setInterval(() => { if (sweepDue()) sweepPastRides(); }, SWEEP_EVERY);
 if (sweepTimer.unref) sweepTimer.unref();
 
 // === Блокування шахраїв ===
@@ -366,8 +391,7 @@ function refreshBans() {
   if (bans.busy) { bans.again = true; return bans.busy; }
   bans.busy = (async () => {
     try {
-      const today = kyivToday();
-      const rides = await Ride.find({ date: { $gte: today } }).select('ownerUid phone tgMessageId').lean();
+      const rides = await Ride.find({ date: { $gte: dayShift(kyivToday(), -1) } }).select('ownerUid phone tgMessageId').lean();
       const uids = [...new Set(rides.map(r => r.ownerUid).filter(Boolean))];
       const phones = [...new Set(rides.map(r => phone9(r.phone)).filter(Boolean))];
       const res = (uids.length || phones.length) ? await askBans(uids, phones) : { uids: new Set(), phones: new Set() };
@@ -388,15 +412,16 @@ function refreshBans() {
   return bans.busy;
 }
 
-// API для отримання поїздок: від сьогодні за Києвом, без поїздок заблокованих
+// API для отримання поїздок: лише ті, що ще не минули (див. «Коли поїздка минула»), без поїздок заблокованих
 app.get('/api/rides', async (req, res) => {
   try {
     if (!bans.at) await Promise.race([refreshBans(), new Promise(r => setTimeout(r, 3000))]); // щойно запустились
     else if (Date.now() - bans.at > BANS_TTL) refreshBans(); // у фоні
-    if (sweepDue()) sweepPastRides(); // нова доба — прибрати минулі поїздки (у фоні)
-    const today = kyivToday(); // поїздку видно до кінця її дня за Києвом
-    const rides = await Ride.find({ date: { $gte: today } }).sort({ date: 1, time: 1 });
-    res.json(rides.filter(r => !isBanned(r)).map(publicRide));
+    if (sweepDue()) sweepPastRides(); // прибрати минулі поїздки з бази й чату (у фоні)
+    const now = Date.now();
+    // Від учорашнього дня: поїздка «вчора з 23:00 до 23:30» видна ще до 00:30
+    const rides = await Ride.find({ date: { $gte: dayShift(kyivToday(now), -1) } }).sort({ date: 1, time: 1 });
+    res.json(rides.filter(r => !isBanned(r) && !rideIsPast(r, now)).map(publicRide));
   } catch (error) {
     serverError(res, 'GET /api/rides', error);
   }
